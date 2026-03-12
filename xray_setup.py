@@ -43,14 +43,12 @@ PORTS = {
     "naive":          4443,
 }
 
-# REALITY destinations — matched to Azure/GitHub Actions infra
+# REALITY destination — DeepSeek only
+# deepseek.com uses TLS 1.3 + X25519 + H2, ideal for REALITY camouflage
 REALITY_DEST_OPTIONS = [
-    {"dest": "www.microsoft.com:443",          "sni": ["www.microsoft.com"],          "fp": "chrome"},
-    {"dest": "login.microsoftonline.com:443",   "sni": ["login.microsoftonline.com"],  "fp": "chrome"},
-    {"dest": "azure.microsoft.com:443",         "sni": ["azure.microsoft.com"],        "fp": "edge"},
-    {"dest": "dl.google.com:443",               "sni": ["dl.google.com"],              "fp": "chrome"},
-    {"dest": "www.github.com:443",              "sni": ["www.github.com"],             "fp": "chrome"},
-    {"dest": "1.1.1.1:443",                     "sni": [],                             "fp": "firefox"},
+    {"dest": "www.deepseek.com:443", "sni": ["www.deepseek.com", "deepseek.com"], "fp": "chrome"},
+    {"dest": "chat.deepseek.com:443","sni": ["chat.deepseek.com"],                "fp": "chrome"},
+    {"dest": "api.deepseek.com:443", "sni": ["api.deepseek.com"],                 "fp": "chrome"},
 ]
 
 WS_PATH      = f"/{secrets.token_hex(8)}"
@@ -131,8 +129,8 @@ def create_certs() -> tuple[str, str]:
     run(
         f'openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes '
         f'-keyout {key} -out {crt} '
-        f'-subj "/CN=microsoft.com/O=Microsoft Corporation/C=US" '
-        f'-addext "subjectAltName=DNS:microsoft.com,DNS:*.microsoft.com" 2>/dev/null',
+        f'-subj "/CN=deepseek.com/O=DeepSeek/C=CN" '
+        f'-addext "subjectAltName=DNS:deepseek.com,DNS:*.deepseek.com" 2>/dev/null',
         silent=True,
     )
     log("Certs created.")
@@ -178,10 +176,9 @@ def enable_bbr() -> None:
 # ─────────────────────────────────────────────────────────────
 
 def install_xray() -> bool:
-    log("Installing Xray ...")
-    run('bash -c "$(curl -L https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)"', True)
+    # Binary pre-downloaded by GitHub Actions workflow steps
     ok = os.path.exists("/usr/local/bin/xray")
-    log(f"Xray {'OK' if ok else 'FAILED'}")
+    log(f"Xray binary: {'found ✓' if ok else 'NOT FOUND ✗'}")
     return ok
 
 def make_xray_config(uid: str, trojan_pass: str, ss_key: str,
@@ -236,7 +233,7 @@ def make_xray_config(uid: str, trojan_pass: str, ss_key: str,
             "settings": {"clients": [{"id": uid}], "decryption": "none"},
             "streamSettings": {
                 "network": "ws",
-                "wsSettings": {"path": WS_PATH, "headers": {"Host": "microsoft.com"}},
+                "wsSettings": {"path": WS_PATH, "headers": {"Host": "www.deepseek.com"}},
                 **tls(["http/1.1"]),
             },
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
@@ -313,20 +310,10 @@ def start_xray() -> bool:
 # ─────────────────────────────────────────────────────────────
 
 def install_hysteria2(hy_pass: str, key: str, crt: str) -> bool:
-    log("Installing Hysteria2 ...")
-    api = "https://api.github.com/repos/apernet/hysteria/releases/latest"
-    try:
-        with urllib.request.urlopen(api, timeout=10) as r:
-            data = json.loads(r.read().decode())
-        ver = data["tag_name"]
-        url = f"https://github.com/apernet/hysteria/releases/download/{ver}/hysteria-linux-amd64"
-    except Exception:
-        url = "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64"
-
-    if not download(url, "/usr/local/bin/hysteria"):
-        log("Hysteria2 FAILED (download)")
+    log("Configuring Hysteria2 ...")
+    if not os.path.exists("/usr/local/bin/hysteria"):
+        log("Hysteria2 binary not found — skipping.")
         return False
-    run("chmod +x /usr/local/bin/hysteria", True)
 
     config = {
         "listen": f":{PORTS['hysteria2']}",
@@ -334,7 +321,7 @@ def install_hysteria2(hy_pass: str, key: str, crt: str) -> bool:
         "auth": {"type": "password", "password": hy_pass},
         "masquerade": {
             "type":   "proxy",
-            "proxy":  {"url": "https://www.microsoft.com", "rewriteHost": True},
+            "proxy":  {"url": "https://www.deepseek.com", "rewriteHost": True},
         },
         "quic": {
             "initStreamReceiveWindow":      26843545,
@@ -364,7 +351,7 @@ auth:
 masquerade:
   type: proxy
   proxy:
-    url: "https://www.microsoft.com"
+    url: "https://www.deepseek.com"
     rewriteHost: true
 quic:
   initStreamReceiveWindow: 26843545
@@ -405,24 +392,11 @@ WantedBy=multi-user.target
 # ─────────────────────────────────────────────────────────────
 
 def install_tuic(tuic_uuid: str, tuic_pass: str, key: str, crt: str) -> bool:
-    log("Installing TUIC v5 ...")
-    api = "https://api.github.com/repos/etjec4/tuic/releases/latest"
-    try:
-        with urllib.request.urlopen(api, timeout=10) as r:
-            data = json.loads(r.read().decode())
-        ver = data["tag_name"]   # e.g. "tuic-server-1.0.0"
-        url = (
-            f"https://github.com/etjec4/tuic/releases/download/{ver}"
-            f"/tuic-server-{ver.split('-')[-1]}-x86_64-unknown-linux-musl"
-        )
-    except Exception:
-        url = "https://github.com/etjec4/tuic/releases/latest/download/tuic-server-1.0.0-x86_64-unknown-linux-musl"
-
-    os.makedirs("/root/tuic", exist_ok=True)
-    if not download(url, "/root/tuic/tuic-server"):
-        log("TUIC FAILED (download)")
+    log("Configuring TUIC v5 ...")
+    if not os.path.exists("/usr/local/bin/tuic-server"):
+        log("TUIC binary not found — skipping.")
         return False
-    run("chmod +x /root/tuic/tuic-server", True)
+    run("cp /usr/local/bin/tuic-server /root/tuic/tuic-server 2>/dev/null || true", True)
 
     config = {
         "server":          f"[::]:{ PORTS['tuic']}",
@@ -467,33 +441,17 @@ WantedBy=multi-user.target
 # ─────────────────────────────────────────────────────────────
 
 def install_naiveproxy(key: str, crt: str) -> bool:
-    log("Installing NaïveProxy (Caddy + naive fork) ...")
-
-    # Install Go
-    go_ver = shell("curl -fsSL https://golang.org/dl/?mode=json 2>/dev/null | grep -oP '\"version\":\"\\K[^\"]+' | head -1")
-    if not go_ver:
-        go_ver = "go1.23.4"
-    go_url = f"https://golang.org/dl/{go_ver}.linux-amd64.tar.gz"
-    if not download(go_url, f"/tmp/{go_ver}.tar.gz"):
-        log("NaïveProxy FAILED (Go download)")
+    log("Configuring NaïveProxy ...")
+    # caddy binary pre-downloaded by workflow
+    caddy_bin = None
+    for p in ["/usr/local/bin/caddy", "/usr/local/bin/naive"]:
+        if os.path.exists(p):
+            caddy_bin = p
+            break
+    if not caddy_bin:
+        log("NaïveProxy binary not found — skipping.")
         return False
-    run(f"rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/{go_ver}.tar.gz", True)
-    os.environ["PATH"] = f"{os.environ['PATH']}:/usr/local/go/bin"
-    os.environ["GOPATH"] = "/root/go"
-
-    # Install xcaddy + build Caddy with naive forwardproxy
-    run("/usr/local/go/bin/go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest", True)
-    run(
-        "/root/go/bin/xcaddy build "
-        "--with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive "
-        "-o /usr/local/bin/caddy",
-        silent=False,
-    )
-    if not os.path.exists("/usr/local/bin/caddy"):
-        log("NaïveProxy FAILED (xcaddy build)")
-        return False
-
-    run("setcap cap_net_bind_service=+ep /usr/local/bin/caddy", True)
+    run(f"setcap cap_net_bind_service=+ep {caddy_bin} 2>/dev/null || true", True)
 
     caddyfile = f"""{{
     order forward_proxy before file_server
@@ -519,13 +477,13 @@ def install_naiveproxy(key: str, crt: str) -> bool:
     with open("/etc/caddy/Caddyfile", "w") as f:
         f.write(caddyfile)
 
-    svc = """[Unit]
+    svc = f"""[Unit]
 Description=NaïveProxy (Caddy)
 After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile
+ExecStart={caddy_bin} run --config /etc/caddy/Caddyfile
 Restart=on-failure
 
 [Install]
@@ -591,7 +549,7 @@ def generate_all_links(ip: str, uid: str, trojan_pass: str, ss_key: str,
         "VLESS WS+TLS": (
             f"vless://{uid}@{host}:{PORTS['ws_tls']}"
             f"?encryption=none&security=tls&sni={host}"
-            f"&type=ws&path={q(WS_PATH)}&host=microsoft.com"
+            f"&type=ws&path={q(WS_PATH)}&host=deepseek.com"
             f"#VLESS-WS-TLS"
         ),
         "Trojan gRPC+TLS": (
@@ -608,7 +566,7 @@ def generate_all_links(ip: str, uid: str, trojan_pass: str, ss_key: str,
         ),
         "Hysteria2": (
             f"hysteria2://{hy_pass}@{ip}:{PORTS['hysteria2']}"
-            f"?insecure=1&sni=microsoft.com"
+            f"?insecure=1&sni=www.deepseek.com"
             f"#Hysteria2"
         ),
         "TUIC v5": (
