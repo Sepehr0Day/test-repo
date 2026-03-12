@@ -1,0 +1,139 @@
+name: 🛡 All-in-One VPN Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_hours:
+        description: "Runtime in hours (max 6)"
+        required: false
+        default: "6"
+
+jobs:
+  vpn-server:
+    name: Start VPN Server
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      DOMAIN:             ${{ secrets.DOMAIN }}
+      RUNTIME_HOURS:      ${{ github.event.inputs.runtime_hours || '6' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── System packages ─────────────────────────────────────
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl unzip openssl jq
+
+      # ── Download Xray ────────────────────────────────────────
+      - name: Download Xray
+        run: |
+          XRAY_VER=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+            | jq -r '.tag_name')
+          echo "Xray version: $XRAY_VER"
+          curl -fsSL \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip" \
+            -o /tmp/xray.zip
+          sudo unzip -o /tmp/xray.zip xray -d /usr/local/bin/
+          sudo chmod +x /usr/local/bin/xray
+          # Download geo data files
+          sudo mkdir -p /usr/local/share/xray
+          curl -fsSL https://github.com/v2fly/geoip/releases/latest/download/geoip.dat \
+            -o /tmp/geoip.dat
+          curl -fsSL https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat \
+            -o /tmp/geosite.dat
+          sudo mv /tmp/geoip.dat   /usr/local/share/xray/geoip.dat
+          sudo mv /tmp/geosite.dat /usr/local/share/xray/geosite.dat
+          xray version
+
+      # ── Download Hysteria2 ────────────────────────────────────
+      - name: Download Hysteria2
+        run: |
+          HY2_VER=$(curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest \
+            | jq -r '.tag_name')
+          echo "Hysteria2 version: $HY2_VER"
+          curl -fsSL \
+            "https://github.com/apernet/hysteria/releases/download/${HY2_VER}/hysteria-linux-amd64" \
+            -o /tmp/hysteria
+          sudo mv /tmp/hysteria /usr/local/bin/hysteria
+          sudo chmod +x /usr/local/bin/hysteria
+          hysteria version
+
+      # ── Download TUIC v5 ──────────────────────────────────────
+      - name: Download TUIC v5
+        run: |
+          TUIC_VER=$(curl -fsSL https://api.github.com/repos/EAimTY/tuic/releases/latest \
+            | jq -r '.tag_name' 2>/dev/null || echo "")
+          # fallback to etjec4/tuic fork
+          if [ -z "$TUIC_VER" ]; then
+            TUIC_VER=$(curl -fsSL https://api.github.com/repos/etjec4/tuic/releases/latest \
+              | jq -r '.tag_name')
+            VER_NUM=$(echo $TUIC_VER | grep -oP '\d+\.\d+\.\d+')
+            curl -fsSL \
+              "https://github.com/etjec4/tuic/releases/download/${TUIC_VER}/tuic-server-${VER_NUM}-x86_64-unknown-linux-musl" \
+              -o /tmp/tuic-server || true
+          else
+            VER_NUM=$(echo $TUIC_VER | grep -oP '\d+\.\d+\.\d+')
+            curl -fsSL \
+              "https://github.com/EAimTY/tuic/releases/download/${TUIC_VER}/tuic-server-${VER_NUM}-x86_64-unknown-linux-musl" \
+              -o /tmp/tuic-server || true
+          fi
+          if [ -f /tmp/tuic-server ] && [ -s /tmp/tuic-server ]; then
+            sudo mv /tmp/tuic-server /usr/local/bin/tuic-server
+            sudo chmod +x /usr/local/bin/tuic-server
+            echo "TUIC downloaded OK"
+          else
+            echo "TUIC download skipped (binary not found)"
+          fi
+
+      # ── Download NaïveProxy (pre-built caddy+forwardproxy) ────
+      - name: Download NaïveProxy
+        run: |
+          NP_VER=$(curl -fsSL https://api.github.com/repos/klzgrad/naiveproxy/releases/latest \
+            | jq -r '.tag_name')
+          echo "NaïveProxy version: $NP_VER"
+          curl -fsSL \
+            "https://github.com/klzgrad/naiveproxy/releases/download/${NP_VER}/naiveproxy-${NP_VER}-linux-x64.tar.xz" \
+            -o /tmp/naive.tar.xz
+          tar -xf /tmp/naive.tar.xz -C /tmp/
+          NAIVE_DIR=$(tar -tf /tmp/naive.tar.xz | head -1 | cut -f1 -d"/")
+          sudo cp /tmp/${NAIVE_DIR}/naive /usr/local/bin/naive || true
+          # caddy is bundled inside naiveproxy release
+          sudo cp /tmp/${NAIVE_DIR}/caddy /usr/local/bin/caddy 2>/dev/null || \
+            sudo cp /tmp/${NAIVE_DIR}/*caddy* /usr/local/bin/caddy 2>/dev/null || true
+          sudo chmod +x /usr/local/bin/naive 2>/dev/null || true
+          sudo chmod +x /usr/local/bin/caddy 2>/dev/null || true
+          ls /tmp/${NAIVE_DIR}/
+          echo "NaïveProxy ready"
+
+      # ── Install Xray as systemd service ──────────────────────
+      - name: Install Xray systemd service
+        run: |
+          sudo mkdir -p /usr/local/etc/xray /var/log/xray
+          printf '%s\n' \
+            '[Unit]' \
+            'Description=Xray Service' \
+            'After=network.target' \
+            '' \
+            '[Service]' \
+            'User=root' \
+            'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json' \
+            'Restart=on-failure' \
+            'RestartPreventExitStatus=23' \
+            '' \
+            '[Install]' \
+            'WantedBy=multi-user.target' \
+            | sudo tee /etc/systemd/system/xray.service > /dev/null
+          sudo systemctl daemon-reload
+
+      # ── Run main setup script ──────────────────────────────────
+      - name: Run VPN setup
+        run: sudo -E python3 vpn_setup.py
