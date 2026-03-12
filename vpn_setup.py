@@ -396,6 +396,7 @@ def install_tuic(tuic_uuid: str, tuic_pass: str, key: str, crt: str) -> bool:
     if not os.path.exists("/usr/local/bin/tuic-server"):
         log("TUIC binary not found — skipping.")
         return False
+    os.makedirs("/root/tuic", exist_ok=True)
     run("cp /usr/local/bin/tuic-server /root/tuic/tuic-server 2>/dev/null || true", True)
 
     config = {
@@ -442,48 +443,37 @@ WantedBy=multi-user.target
 
 def install_naiveproxy(key: str, crt: str) -> bool:
     log("Configuring NaïveProxy ...")
-    # caddy binary pre-downloaded by workflow
-    caddy_bin = None
-    for p in ["/usr/local/bin/caddy", "/usr/local/bin/naive"]:
-        if os.path.exists(p):
-            caddy_bin = p
-            break
-    if not caddy_bin:
+    # naiveproxy releases ship a standalone 'naive' binary (Chromium-based)
+    # It acts as both server and client using HTTP/2 CONNECT
+    naive_bin = "/usr/local/bin/naive"
+    if not os.path.exists(naive_bin):
         log("NaïveProxy binary not found — skipping.")
         return False
-    run(f"setcap cap_net_bind_service=+ep {caddy_bin} 2>/dev/null || true", True)
+    run(f"setcap cap_net_bind_service=+ep {naive_bin} 2>/dev/null || true", True)
 
-    caddyfile = f"""{{
-    order forward_proxy before file_server
-}}
-
-:{PORTS['naive']}, localhost:{PORTS['naive']} {{
-    tls {crt} {key}
-    forward_proxy {{
-        basic_auth {NAIVE_USER} {NAIVE_PASS}
-        hide_ip
-        hide_via
-        probe_resistance
-    }}
-    file_server {{
-        root /var/www/html
-    }}
-}}
-"""
-    os.makedirs("/etc/caddy", exist_ok=True)
+    # naive binary uses a JSON config (not Caddyfile)
+    naive_config = {
+        "listen": f"https://:{PORTS['naive']}",
+        "proxy":  f"https://{NAIVE_USER}:{NAIVE_PASS}@",
+        "log":    "",
+        "padding": True,
+        "certificate": crt,
+        "key":     key,
+    }
+    os.makedirs("/etc/naive", exist_ok=True)
     os.makedirs("/var/www/html", exist_ok=True)
     with open("/var/www/html/index.html", "w") as f:
         f.write("<html><body>Welcome</body></html>")
-    with open("/etc/caddy/Caddyfile", "w") as f:
-        f.write(caddyfile)
+    with open("/etc/naive/config.json", "w") as f:
+        json.dump(naive_config, f, indent=2)
 
     svc = f"""[Unit]
-Description=NaïveProxy (Caddy)
+Description=NaïveProxy
 After=network.target
 
 [Service]
 User=root
-ExecStart={caddy_bin} run --config /etc/caddy/Caddyfile
+ExecStart={naive_bin} /etc/naive/config.json
 Restart=on-failure
 
 [Install]
@@ -675,29 +665,48 @@ def main() -> None:
     results = {}
 
     def task_xray():
-        if install_xray():
-            make_xray_config(uid, trojan_pass, ss_key, key, crt, dest_opt, sid)
-            ok = start_xray()
-            # Read public key written during config generation
-            try:
-                with open("/tmp/xray_pubkey") as f:
-                    pub = f.read().strip()
-            except Exception:
-                pub = shell("xray x25519").split("\n")[1].split(":", 1)[1].strip()
-            return ("xray", ok, pub)
-        return ("xray", False, "")
+        try:
+            if install_xray():
+                make_xray_config(uid, trojan_pass, ss_key, key, crt, dest_opt, sid)
+                ok = start_xray()
+                try:
+                    with open("/tmp/xray_pubkey") as f:
+                        pub = f.read().strip()
+                except Exception:
+                    pub = shell("xray x25519").split("\n")[1].split(":", 1)[1].strip()
+                return ("xray", ok, pub)
+            return ("xray", False, "")
+        except Exception as e:
+            log(f"[xray] exception: {e}")
+            return ("xray", False, "")
 
     def task_hy2():
-        return ("hysteria2", install_hysteria2(hy_pass, key, crt))
+        try:
+            return ("hysteria2", install_hysteria2(hy_pass, key, crt))
+        except Exception as e:
+            log(f"[hysteria2] exception: {e}")
+            return ("hysteria2", False)
 
     def task_tuic():
-        return ("tuic", install_tuic(tuic_uuid, tuic_pass, key, crt))
+        try:
+            return ("tuic", install_tuic(tuic_uuid, tuic_pass, key, crt))
+        except Exception as e:
+            log(f"[tuic] exception: {e}")
+            return ("tuic", False)
 
     def task_naive():
-        return ("naive", install_naiveproxy(key, crt))
+        try:
+            return ("naive", install_naiveproxy(key, crt))
+        except Exception as e:
+            log(f"[naive] exception: {e}")
+            return ("naive", False)
 
     def task_ssh():
-        return ("ssh", setup_ssh())
+        try:
+            return ("ssh", setup_ssh())
+        except Exception as e:
+            log(f"[ssh] exception: {e}")
+            return ("ssh", False)
 
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = [
