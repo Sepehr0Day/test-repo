@@ -1,4 +1,4 @@
-name: 🛡 All-in-One VPN Server
+name: All-in-One VPN Server
 
 on:
   workflow_dispatch:
