@@ -1,132 +1,97 @@
 #!/usr/bin/env python3
 """
-Xray Advanced VPN Setup — Anti-Censorship / Anti-DPI
-Protocols: VLESS+REALITY+Vision, VLESS+REALITY+gRPC, VLESS+WS+TLS,
-           Trojan+gRPC+TLS, VLESS+H2+TLS, Shadowsocks2022, VLESS+SplitHTTP
+All-in-One Anti-Censorship VPN Setup for GitHub Actions
+========================================================
+Protocols installed in parallel:
+  1. Xray  — VLESS+REALITY+Vision  (port 443)
+  2. Xray  — VLESS+REALITY+gRPC    (port 8443)
+  3. Xray  — VLESS+WS+TLS          (port 2053)
+  4. Xray  — Trojan+gRPC+TLS       (port 2083)
+  5. Xray  — Shadowsocks 2022      (port 1080)
+  6. Hysteria2 — QUIC+BBR          (port 5443)
+  7. TUIC v5   — QUIC 0-RTT        (port 9443)
+  8. NaïveProxy — Chromium HTTP/2  (port 4443)
+  9. SSH SOCKS5 — always-on        (port 22)
 
-REALITY dest selection logic (from Xray-core GitHub research):
-  - The (IP, SNI) tuple must be logically consistent.
-  - GitHub Actions runs on Microsoft Azure infra → Microsoft/Azure SNIs are ideal.
-  - Never use Cloudflare-backed sites as dest (causes your server to be abused as SNI proxy).
-  - dl.google.com bonus: TLS handshake messages are encrypted after Server Hello.
-  - 1.1.1.1:443 with empty serverNames can bypass Iran throttling.
+Runtime: up to 6 hours (GitHub Actions max)
 """
 
-import os, json, uuid, subprocess, time, urllib.request, urllib.parse
-import base64, secrets, random, socket
+import os, json, uuid, subprocess, time, base64, secrets, random
+import socket, threading, urllib.request, urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─────────────────────────────────────────────────────────────
-#  ENV  (set in GitHub Actions secrets)
+#  ENVIRONMENT
 # ─────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-DOMAIN             = os.getenv("DOMAIN", "")   # optional real domain
+DOMAIN             = os.getenv("DOMAIN", "")
+RUNTIME_HOURS      = int(os.getenv("RUNTIME_HOURS", "6"))   # GitHub Actions max = 6h
 
-CONFIG_PATH = "/usr/local/etc/xray/config.json"
+XRAY_CONFIG   = "/usr/local/etc/xray/config.json"
+CERT_DIR      = "/usr/local/etc/vpn/certs"
+LOG_DIR       = "/var/log/vpn"
 
 PORTS = {
-    "reality_vision": 443,    # VLESS + REALITY + Vision  (port 443 = most trusted)
-    "reality_grpc":   8443,   # VLESS + REALITY + gRPC    (more resistant in Iran per research)
-    "ws_tls":         2053,   # VLESS + WS + TLS          (CDN-friendly, Cloudflare ports)
-    "grpc_tls":       2083,   # Trojan + gRPC + TLS       (HTTP/2 multiplexed)
-    "h2_tls":         2087,   # VLESS + H2 + TLS          (Cloudflare port, less suspicious)
-    "ss2022":         1080,   # Shadowsocks 2022           (AEAD, anti-replay)
-    "splithttp":      8880,   # VLESS + SplitHTTP          (looks like plain HTTP)
+    "reality_vision": 443,
+    "reality_grpc":   8443,
+    "ws_tls":         2053,
+    "grpc_tls":       2083,
+    "ss2022":         1080,
+    "hysteria2":      5443,
+    "tuic":           9443,
+    "naive":          4443,
 }
 
-# ─────────────────────────────────────────────────────────────
-#  REALITY DESTINATIONS
-#
-#  Selection rationale (GitHub Actions = Azure datacenters):
-#  - Microsoft/Azure domains are the most logical match for GitHub Actions IPs
-#  - dl.google.com: TLS messages encrypted after Server Hello (extra obfuscation)
-#  - 1.1.1.1:443 + empty SNI: bypasses Iran SNI-based throttling entirely
-#  - Never pick Cloudflare-backed sites (gets your server abused as SNI proxy)
-#  - Never pick sites obviously mismatched to the VPS datacenter region
-# ─────────────────────────────────────────────────────────────
+# REALITY destinations — matched to Azure/GitHub Actions infra
 REALITY_DEST_OPTIONS = [
-    # Tier 1 — Microsoft/Azure: perfect match for GitHub Actions infra
-    {
-        "dest":   "www.microsoft.com:443",
-        "sni":    ["www.microsoft.com", "microsoft.com"],
-        "fp":     "chrome",
-        "reason": "Exact ASN match with GitHub Actions (Azure)"
-    },
-    {
-        "dest":   "login.microsoftonline.com:443",
-        "sni":    ["login.microsoftonline.com"],
-        "fp":     "chrome",
-        "reason": "Azure AD — same infra as GitHub Actions"
-    },
-    {
-        "dest":   "azure.microsoft.com:443",
-        "sni":    ["azure.microsoft.com"],
-        "fp":     "edge",
-        "reason": "Azure portal — same Microsoft ASN"
-    },
-    # Tier 2 — Google: dl.google.com encrypts after Server Hello (bonus obfuscation)
-    {
-        "dest":   "dl.google.com:443",
-        "sni":    ["dl.google.com"],
-        "fp":     "chrome",
-        "reason": "Encrypted handshake after Server Hello — harder to fingerprint"
-    },
-    {
-        "dest":   "www.google.com:443",
-        "sni":    ["www.google.com"],
-        "fp":     "chrome",
-        "reason": "Google — widely whitelisted, strong TLS 1.3 + H2"
-    },
-    # Tier 3 — Special: 1.1.1.1 with no SNI bypasses Iran SNI throttling
-    {
-        "dest":   "1.1.1.1:443",
-        "sni":    [],           # empty = bypass SNI whitelist checks
-        "fp":     "firefox",
-        "reason": "Empty SNI trick — bypasses Iran speed throttling"
-    },
-    # Tier 4 — Other well-known TLS 1.3 + H2 sites
-    {
-        "dest":   "www.cloudflare.com:443",
-        "sni":    ["www.cloudflare.com"],
-        "fp":     "chrome",
-        "reason": "Cloudflare main site (not CDN IP — safe)"
-    },
-    {
-        "dest":   "www.github.com:443",
-        "sni":    ["www.github.com", "github.com"],
-        "fp":     "chrome",
-        "reason": "GitHub — also Azure infra, highly trusted SNI"
-    },
+    {"dest": "www.microsoft.com:443",          "sni": ["www.microsoft.com"],          "fp": "chrome"},
+    {"dest": "login.microsoftonline.com:443",   "sni": ["login.microsoftonline.com"],  "fp": "chrome"},
+    {"dest": "azure.microsoft.com:443",         "sni": ["azure.microsoft.com"],        "fp": "edge"},
+    {"dest": "dl.google.com:443",               "sni": ["dl.google.com"],              "fp": "chrome"},
+    {"dest": "www.github.com:443",              "sni": ["www.github.com"],             "fp": "chrome"},
+    {"dest": "1.1.1.1:443",                     "sni": [],                             "fp": "firefox"},
 ]
 
 WS_PATH      = f"/{secrets.token_hex(8)}"
-GRPC_SERVICE = secrets.token_hex(6)
+GRPC_SVC     = secrets.token_hex(6)
 H2_PATH      = f"/{secrets.token_hex(8)}"
-SPLIT_PATH   = f"/{secrets.token_hex(8)}"
+NAIVE_USER   = secrets.token_hex(6)
+NAIVE_PASS   = secrets.token_hex(16)
+SSH_USER     = "sshproxy"
+SSH_PASS     = secrets.token_hex(12)
 
 
 # ─────────────────────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────────────────────
 
-def run(cmd):
-    os.system(cmd)
+def run(cmd: str, silent: bool = False) -> int:
+    if silent:
+        return os.system(f"{cmd} >/dev/null 2>&1")
+    return os.system(cmd)
 
-def shell(cmd):
+def shell(cmd: str) -> str:
     return subprocess.getoutput(cmd)
 
-def get_server_ip():
+def get_server_ip() -> str:
     for url in ["https://api.ipify.org", "https://ifconfig.me", "https://ipecho.net/plain"]:
         try:
             with urllib.request.urlopen(url, timeout=5) as r:
                 ip = r.read().decode().strip()
                 if ip:
                     return ip
-        except:
+        except Exception:
             pass
     return shell("hostname -I | awk '{print $1}'")
 
-def send_telegram(text):
+def resolve(host: str) -> str | None:
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        return None
+
+def send_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -137,301 +102,182 @@ def send_telegram(text):
         "disable_web_page_preview": True,
     }).encode()
     try:
-        with urllib.request.urlopen(url, data=data, timeout=10) as r:
+        with urllib.request.urlopen(url, data=data, timeout=15) as r:
             if json.loads(r.read().decode()).get("ok"):
-                print("[Telegram] sent ✓")
+                print("  [Telegram] sent ✓")
     except Exception as e:
-        print(f"[Telegram] failed: {e}")
+        print(f"  [Telegram] failed: {e}")
 
-def resolve_ip(hostname):
-    """Resolve a hostname to its first IP address."""
+def log(msg: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}")
+
+def download(url: str, dest: str) -> bool:
     try:
-        return socket.gethostbyname(hostname)
-    except:
-        return None
+        run(f"curl -fsSL '{url}' -o '{dest}'", silent=True)
+        return os.path.exists(dest) and os.path.getsize(dest) > 1000
+    except Exception:
+        return False
 
 
 # ─────────────────────────────────────────────────────────────
-#  INSTALLATION
+#  CERTS
 # ─────────────────────────────────────────────────────────────
 
-def install_xray():
-    print("[*] Installing Xray ...")
-    run('bash -c "$(curl -L https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)"')
-    print("[OK] Xray installed.")
-
-def generate_reality_keys():
-    out  = shell("xray x25519")
-    priv = out.split("\n")[0].split(":", 1)[1].strip()
-    pub  = out.split("\n")[1].split(":", 1)[1].strip()
-    return priv, pub
-
-def generate_ss2022_key():
-    return base64.b64encode(secrets.token_bytes(32)).decode()
-
-def create_self_signed_cert():
-    d = "/usr/local/etc/xray/certs"
-    os.makedirs(d, exist_ok=True)
-    key, crt = f"{d}/server.key", f"{d}/server.crt"
+def create_certs() -> tuple[str, str]:
+    os.makedirs(CERT_DIR, exist_ok=True)
+    key = f"{CERT_DIR}/key.pem"
+    crt = f"{CERT_DIR}/crt.pem"
     run(
         f'openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes '
         f'-keyout {key} -out {crt} '
         f'-subj "/CN=microsoft.com/O=Microsoft Corporation/C=US" '
-        f'-addext "subjectAltName=DNS:microsoft.com,DNS:*.microsoft.com" '
-        f'2>/dev/null'
+        f'-addext "subjectAltName=DNS:microsoft.com,DNS:*.microsoft.com" 2>/dev/null',
+        silent=True,
     )
+    log("Certs created.")
     return key, crt
 
-def pick_best_reality_dest():
-    """
-    Pick the best REALITY dest based on connectivity from this machine.
-    Tier 1 (Microsoft/Azure) is tried first since GitHub Actions runs on Azure.
-    Falls back to Google, then others.
-    """
-    print("[*] Selecting REALITY dest (testing connectivity) ...")
-    for option in REALITY_DEST_OPTIONS:
-        host = option["dest"].split(":")[0]
-        ip   = resolve_ip(host)
-        if ip:
-            print(f"[OK] Selected dest: {option['dest']}  ({option['reason']})")
-            return option
-    # Absolute fallback
-    print("[!] All dests failed DNS. Using 1.1.1.1 fallback.")
-    return REALITY_DEST_OPTIONS[5]   # 1.1.1.1 entry
+def pick_reality_dest() -> dict:
+    for opt in REALITY_DEST_OPTIONS:
+        host = opt["dest"].split(":")[0]
+        if host == "1.1.1.1" or resolve(host):
+            log(f"REALITY dest → {opt['dest']}")
+            return opt
+    return REALITY_DEST_OPTIONS[-1]
 
 
 # ─────────────────────────────────────────────────────────────
 #  IPTABLES — forward UDP/443 + TCP/80 to dest IP
-#  This makes the server look exactly like the dest site from outside.
 # ─────────────────────────────────────────────────────────────
 
-def setup_iptables_forwarding(dest_host):
-    dest_ip = resolve_ip(dest_host)
+def setup_iptables(dest_host: str) -> None:
+    dest_ip = resolve(dest_host)
     if not dest_ip:
-        print(f"[!] Could not resolve {dest_host} for iptables forwarding.")
         return
     iface = shell("ip route | grep default | awk '{print $5}' | head -1")
-    print(f"[*] Setting up UDP/443 + TCP/80 forwarding to {dest_ip} via {iface} ...")
-    # UDP 443 (QUIC) forwarding — makes server respond to QUIC probes like the real site
-    run(f"iptables -t nat -A PREROUTING -i {iface} -p udp --dport 443 -j DNAT --to-destination {dest_ip}:443")
-    # TCP 80 forwarding — HTTP probes also match the real site
-    run(f"iptables -t nat -A PREROUTING -i {iface} -p tcp --dport 80  -j DNAT --to-destination {dest_ip}:80")
-    run("iptables -t nat -A POSTROUTING -j MASQUERADE")
-    run("sysctl -w net.ipv4.ip_forward=1 > /dev/null")
-    print(f"[OK] Forwarding active: UDP/443 + TCP/80 → {dest_ip}")
+    run(f"iptables -t nat -A PREROUTING -i {iface} -p udp --dport 443 -j DNAT --to-destination {dest_ip}:443", True)
+    run(f"iptables -t nat -A PREROUTING -i {iface} -p tcp --dport 80  -j DNAT --to-destination {dest_ip}:80",  True)
+    run("iptables -t nat -A POSTROUTING -j MASQUERADE", True)
+    run("sysctl -w net.ipv4.ip_forward=1 > /dev/null", True)
+    log(f"iptables → UDP/443 + TCP/80 forwarded to {dest_ip}")
 
 
 # ─────────────────────────────────────────────────────────────
-#  CONFIG
+#  BBR CONGESTION CONTROL
 # ─────────────────────────────────────────────────────────────
 
-def tls_settings(key, crt, alpn):
-    return {
-        "security": "tls",
-        "tlsSettings": {
-            "certificates": [{"certificateFile": crt, "keyFile": key}],
-            "alpn":         alpn,
-            "minVersion":   "1.2",
-            "cipherSuites": (
-                "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
-                ":TLS_CHACHA20_POLY1305_SHA256"
-            ),
-        },
-    }
+def enable_bbr() -> None:
+    run("sysctl -w net.core.default_qdisc=fq > /dev/null",         True)
+    run("sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null", True)
+    log("BBR congestion control enabled.")
 
-def create_config(priv, uid, trojan_pass, ss_key, key, crt, dest_option, sid):
-    dest  = dest_option["dest"]
-    sni   = dest_option["sni"]
-    fp    = dest_option["fp"]
-    tls_h2   = tls_settings(key, crt, ["h2", "http/1.1"])
-    tls_http = tls_settings(key, crt, ["http/1.1"])
 
-    reality_base = {
-        "show":        False,
-        "dest":        dest,
-        "xver":        0,
-        "serverNames": sni,
-        "privateKey":  priv,
+# ─────────────────────────────────────────────────────────────
+#  XRAY
+# ─────────────────────────────────────────────────────────────
+
+def install_xray() -> bool:
+    log("Installing Xray ...")
+    run('bash -c "$(curl -L https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)"', True)
+    ok = os.path.exists("/usr/local/bin/xray")
+    log(f"Xray {'OK' if ok else 'FAILED'}")
+    return ok
+
+def make_xray_config(uid: str, trojan_pass: str, ss_key: str,
+                     key: str, crt: str, dest_opt: dict, sid: str) -> None:
+
+    def tls(alpn):
+        return {
+            "security": "tls",
+            "tlsSettings": {
+                "certificates": [{"certificateFile": crt, "keyFile": key}],
+                "alpn": alpn,
+                "minVersion": "1.2",
+                "cipherSuites":
+                    "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+                    ":TLS_CHACHA20_POLY1305_SHA256",
+            },
+        }
+
+    reality = {
+        "show": False, "dest": dest_opt["dest"], "xver": 0,
+        "serverNames": dest_opt["sni"],
+        "privateKey":  shell("xray x25519").split("\n")[0].split(":", 1)[1].strip(),
         "shortIds":    [sid, secrets.token_hex(8), ""],
-        "fingerprint": fp,
+        "fingerprint": dest_opt["fp"],
         "maxTimeDiff": 60000,
     }
+    # Store public key for link generation
+    xray_pub = shell("xray x25519").split("\n")[1].split(":", 1)[1].strip()
 
     inbounds = [
-
-        # 1 — VLESS + REALITY + Vision
-        #     Best overall camouflage. Vision flow prevents TLS-in-TLS detection.
+        # 1 VLESS + REALITY + Vision
         {
-            "tag": "vless-reality-vision",
-            "port": PORTS["reality_vision"],
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uid, "flow": "xtls-rprx-vision"}],
-                "decryption": "none",
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": reality_base,
-            },
+            "tag": "reality-vision", "port": PORTS["reality_vision"], "protocol": "vless",
+            "settings": {"clients": [{"id": uid, "flow": "xtls-rprx-vision"}], "decryption": "none"},
+            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": reality},
             "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
         },
-
-        # 2 — VLESS + REALITY + gRPC
-        #     Research shows gRPC variant is MORE resistant in Iran than Vision.
-        #     HTTP/2 frames make traffic pattern very different from plain TCP.
+        # 2 VLESS + REALITY + gRPC
         {
-            "tag": "vless-reality-grpc",
-            "port": PORTS["reality_grpc"],
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uid}],
-                "decryption": "none",
-            },
+            "tag": "reality-grpc", "port": PORTS["reality_grpc"], "protocol": "vless",
+            "settings": {"clients": [{"id": uid}], "decryption": "none"},
             "streamSettings": {
-                "network": "grpc",
-                "security": "reality",
-                "grpcSettings": {
-                    "serviceName": GRPC_SERVICE,
-                    "multiMode":   True,
-                },
-                "realitySettings": reality_base,
+                "network": "grpc", "security": "reality",
+                "grpcSettings": {"serviceName": GRPC_SVC, "multiMode": True},
+                "realitySettings": reality,
             },
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
         },
-
-        # 3 — VLESS + WebSocket + TLS  (CDN-compatible, Cloudflare port 2053)
+        # 3 VLESS + WebSocket + TLS
         {
-            "tag": "vless-ws-tls",
-            "port": PORTS["ws_tls"],
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uid}],
-                "decryption": "none",
-            },
+            "tag": "vless-ws", "port": PORTS["ws_tls"], "protocol": "vless",
+            "settings": {"clients": [{"id": uid}], "decryption": "none"},
             "streamSettings": {
                 "network": "ws",
-                "wsSettings": {
-                    "path":    WS_PATH,
-                    "headers": {"Host": "microsoft.com"},
-                },
-                **tls_http,
+                "wsSettings": {"path": WS_PATH, "headers": {"Host": "microsoft.com"}},
+                **tls(["http/1.1"]),
             },
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
         },
-
-        # 4 — Trojan + gRPC + TLS  (HTTP/2 multiplexed, looks like Google APIs)
+        # 4 Trojan + gRPC + TLS
         {
-            "tag": "trojan-grpc-tls",
-            "port": PORTS["grpc_tls"],
-            "protocol": "trojan",
-            "settings": {
-                "clients": [{"password": trojan_pass}],
-            },
+            "tag": "trojan-grpc", "port": PORTS["grpc_tls"], "protocol": "trojan",
+            "settings": {"clients": [{"password": trojan_pass}]},
             "streamSettings": {
                 "network": "grpc",
-                "grpcSettings": {
-                    "serviceName":          GRPC_SERVICE,
-                    "multiMode":            True,
-                    "idle_timeout":         60,
-                    "health_check_timeout": 20,
-                },
-                **tls_h2,
+                "grpcSettings": {"serviceName": GRPC_SVC, "multiMode": True},
+                **tls(["h2", "http/1.1"]),
             },
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
         },
-
-        # 5 — VLESS + H2 + TLS  (Cloudflare port 2087 — less suspicious)
+        # 5 Shadowsocks 2022
         {
-            "tag": "vless-h2-tls",
-            "port": PORTS["h2_tls"],
-            "protocol": "vless",
+            "tag": "ss2022", "port": PORTS["ss2022"], "protocol": "shadowsocks",
             "settings": {
-                "clients": [{"id": uid}],
-                "decryption": "none",
-            },
-            "streamSettings": {
-                "network": "h2",
-                "httpSettings": {
-                    "path": H2_PATH,
-                    "host": ["microsoft.com"],
-                    "read_idle_timeout":     30,
-                    "health_check_timeout":  15,
-                },
-                **tls_h2,
-            },
-            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
-        },
-
-        # 6 — Shadowsocks 2022  (AEAD + anti-replay, traffic looks like random bytes)
-        {
-            "tag": "ss-2022",
-            "port": PORTS["ss2022"],
-            "protocol": "shadowsocks",
-            "settings": {
-                "method":   "2022-blake3-aes-256-gcm",
-                "password": ss_key,
-                "network":  "tcp,udp",
-                "ivCheck":  True,
-            },
-        },
-
-        # 7 — VLESS + SplitHTTP  (newest Xray protocol, mimics chunked HTTP uploads)
-        {
-            "tag": "vless-splithttp",
-            "port": PORTS["splithttp"],
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uid}],
-                "decryption": "none",
-            },
-            "streamSettings": {
-                "network": "splithttp",
-                "splitHttpSettings": {
-                    "path":                  SPLIT_PATH,
-                    "host":                  "microsoft.com",
-                    "maxUploadSize":         1000000,
-                    "maxConcurrentUploads":  10,
-                },
+                "method": "2022-blake3-aes-256-gcm",
+                "password": ss_key, "network": "tcp,udp", "ivCheck": True,
             },
         },
     ]
 
     config = {
-        "log": {
-            "loglevel": "warning",
-            "access":   "/var/log/xray/access.log",
-            "error":    "/var/log/xray/error.log",
-        },
+        "log": {"loglevel": "warning",
+                "access": f"{LOG_DIR}/xray_access.log",
+                "error":  f"{LOG_DIR}/xray_error.log"},
         "dns": {
             "servers": [
-                {"address": "8.8.8.8",  "domains": ["geosite:geolocation-!cn"]},
-                {"address": "1.1.1.1",  "domains": ["geosite:geolocation-!cn"]},
-                "localhost",
+                {"address": "8.8.8.8", "domains": ["geosite:geolocation-!cn"]},
+                "1.1.1.1", "localhost",
             ],
             "queryStrategy": "UseIPv4",
         },
         "routing": {
             "domainStrategy": "IPIfNonMatch",
             "rules": [
-                # Block ads
-                {
-                    "type":         "field",
-                    "domain":       ["geosite:category-ads-all"],
-                    "outboundTag":  "block"
-                },
-                # Block connections back to Iran (prevents probe traffic loop)
-                {
-                    "type":         "field",
-                    "ip":           ["geoip:ir"],
-                    "outboundTag":  "block"
-                },
-                # Block private IPs (prevents SSRF)
-                {
-                    "type":         "field",
-                    "ip":           ["geoip:private"],
-                    "outboundTag":  "block"
-                },
+                {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
+                {"type": "field", "ip": ["geoip:ir", "geoip:private"],    "outboundTag": "block"},
             ],
         },
         "inbounds": inbounds,
@@ -440,55 +286,309 @@ def create_config(priv, uid, trojan_pass, ss_key, key, crt, dest_option, sid):
             {"tag": "block",  "protocol": "blackhole",  "settings": {}},
         ],
         "policy": {
-            "levels": {"0": {
-                "handshake":   4,
-                "connIdle":    300,
-                "uplinkOnly":  2,
-                "downlinkOnly": 5,
-            }},
-            "system": {
-                "statsInboundUplink":   True,
-                "statsInboundDownlink": True,
-            },
+            "levels": {"0": {"handshake": 4, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5}},
+            "system": {"statsInboundUplink": True, "statsInboundDownlink": True},
         },
     }
 
     os.makedirs("/usr/local/etc/xray", exist_ok=True)
-    os.makedirs("/var/log/xray", exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(XRAY_CONFIG, "w") as f:
         json.dump(config, f, indent=2)
-    print("[OK] Config written.")
+
+    # Save public key for link generation
+    with open("/tmp/xray_pubkey", "w") as f:
+        f.write(xray_pub)
+
+def start_xray() -> bool:
+    run("systemctl restart xray && systemctl enable xray", True)
+    time.sleep(2)
+    ok = shell("systemctl is-active xray") == "active"
+    log(f"Xray service: {'running ✓' if ok else 'FAILED ✗'}")
+    return ok
+
+
+# ─────────────────────────────────────────────────────────────
+#  HYSTERIA 2
+# ─────────────────────────────────────────────────────────────
+
+def install_hysteria2(hy_pass: str, key: str, crt: str) -> bool:
+    log("Installing Hysteria2 ...")
+    api = "https://api.github.com/repos/apernet/hysteria/releases/latest"
+    try:
+        with urllib.request.urlopen(api, timeout=10) as r:
+            data = json.loads(r.read().decode())
+        ver = data["tag_name"]
+        url = f"https://github.com/apernet/hysteria/releases/download/{ver}/hysteria-linux-amd64"
+    except Exception:
+        url = "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64"
+
+    if not download(url, "/usr/local/bin/hysteria"):
+        log("Hysteria2 FAILED (download)")
+        return False
+    run("chmod +x /usr/local/bin/hysteria", True)
+
+    config = {
+        "listen": f":{PORTS['hysteria2']}",
+        "tls": {"cert": crt, "key": key},
+        "auth": {"type": "password", "password": hy_pass},
+        "masquerade": {
+            "type":   "proxy",
+            "proxy":  {"url": "https://www.microsoft.com", "rewriteHost": True},
+        },
+        "quic": {
+            "initStreamReceiveWindow":      26843545,
+            "maxStreamReceiveWindow":       26843545,
+            "initConnReceiveWindow":        67108864,
+            "maxConnReceiveWindow":         67108864,
+            "maxIdleTimeout":              "30s",
+            "maxIncomingStreams":            1024,
+            "disablePathMTUDiscovery":      False,
+        },
+        "bandwidth": {"up": "1 gbps", "down": "1 gbps"},
+        "ignoreClientBandwidth": False,
+        "speedTest": False,
+        "logging": {"level": "warn", "timestamp": True},
+    }
+    os.makedirs("/etc/hysteria", exist_ok=True)
+    with open("/etc/hysteria/config.yaml", "w") as f:
+        import re
+        # Write YAML manually (no pyyaml guaranteed)
+        f.write(f"""listen: ":{PORTS['hysteria2']}"
+tls:
+  cert: "{crt}"
+  key: "{key}"
+auth:
+  type: password
+  password: "{hy_pass}"
+masquerade:
+  type: proxy
+  proxy:
+    url: "https://www.microsoft.com"
+    rewriteHost: true
+quic:
+  initStreamReceiveWindow: 26843545
+  maxStreamReceiveWindow: 26843545
+  initConnReceiveWindow: 67108864
+  maxConnReceiveWindow: 67108864
+  maxIdleTimeout: 30s
+  maxIncomingStreams: 1024
+bandwidth:
+  up: "1 gbps"
+  down: "1 gbps"
+logging:
+  level: warn
+""")
+
+    svc = """[Unit]
+Description=Hysteria2 VPN
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+"""
+    with open("/etc/systemd/system/hysteria2.service", "w") as f:
+        f.write(svc)
+    run("systemctl daemon-reload && systemctl enable --now hysteria2", True)
+    time.sleep(2)
+    ok = shell("systemctl is-active hysteria2") == "active"
+    log(f"Hysteria2: {'running ✓' if ok else 'FAILED ✗'}")
+    return ok
+
+
+# ─────────────────────────────────────────────────────────────
+#  TUIC v5
+# ─────────────────────────────────────────────────────────────
+
+def install_tuic(tuic_uuid: str, tuic_pass: str, key: str, crt: str) -> bool:
+    log("Installing TUIC v5 ...")
+    api = "https://api.github.com/repos/etjec4/tuic/releases/latest"
+    try:
+        with urllib.request.urlopen(api, timeout=10) as r:
+            data = json.loads(r.read().decode())
+        ver = data["tag_name"]   # e.g. "tuic-server-1.0.0"
+        url = (
+            f"https://github.com/etjec4/tuic/releases/download/{ver}"
+            f"/tuic-server-{ver.split('-')[-1]}-x86_64-unknown-linux-musl"
+        )
+    except Exception:
+        url = "https://github.com/etjec4/tuic/releases/latest/download/tuic-server-1.0.0-x86_64-unknown-linux-musl"
+
+    os.makedirs("/root/tuic", exist_ok=True)
+    if not download(url, "/root/tuic/tuic-server"):
+        log("TUIC FAILED (download)")
+        return False
+    run("chmod +x /root/tuic/tuic-server", True)
+
+    config = {
+        "server":          f"[::]:{ PORTS['tuic']}",
+        "users":           {tuic_uuid: tuic_pass},
+        "certificate":     crt,
+        "private_key":     key,
+        "congestion_control": "bbr",
+        "alpn":            ["h3", "spdy/3.1"],
+        "udp_relay_ipv6":  True,
+        "zero_rtt_handshake": False,
+        "auth_timeout":    "3s",
+        "max_idle_time":   "10s",
+        "log_level":       "warn",
+    }
+    with open("/root/tuic/config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+    svc = """[Unit]
+Description=TUIC v5 Proxy
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/root/tuic
+ExecStart=/root/tuic/tuic-server -c /root/tuic/config.json
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+"""
+    with open("/etc/systemd/system/tuic.service", "w") as f:
+        f.write(svc)
+    run("systemctl daemon-reload && systemctl enable --now tuic", True)
+    time.sleep(2)
+    ok = shell("systemctl is-active tuic") == "active"
+    log(f"TUIC v5: {'running ✓' if ok else 'FAILED ✗'}")
+    return ok
+
+
+# ─────────────────────────────────────────────────────────────
+#  NAÏVEPROXY  (Caddy + forwardproxy@naive)
+# ─────────────────────────────────────────────────────────────
+
+def install_naiveproxy(key: str, crt: str) -> bool:
+    log("Installing NaïveProxy (Caddy + naive fork) ...")
+
+    # Install Go
+    go_ver = shell("curl -fsSL https://golang.org/dl/?mode=json 2>/dev/null | grep -oP '\"version\":\"\\K[^\"]+' | head -1")
+    if not go_ver:
+        go_ver = "go1.23.4"
+    go_url = f"https://golang.org/dl/{go_ver}.linux-amd64.tar.gz"
+    if not download(go_url, f"/tmp/{go_ver}.tar.gz"):
+        log("NaïveProxy FAILED (Go download)")
+        return False
+    run(f"rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/{go_ver}.tar.gz", True)
+    os.environ["PATH"] = f"{os.environ['PATH']}:/usr/local/go/bin"
+    os.environ["GOPATH"] = "/root/go"
+
+    # Install xcaddy + build Caddy with naive forwardproxy
+    run("/usr/local/go/bin/go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest", True)
+    run(
+        "/root/go/bin/xcaddy build "
+        "--with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive "
+        "-o /usr/local/bin/caddy",
+        silent=False,
+    )
+    if not os.path.exists("/usr/local/bin/caddy"):
+        log("NaïveProxy FAILED (xcaddy build)")
+        return False
+
+    run("setcap cap_net_bind_service=+ep /usr/local/bin/caddy", True)
+
+    caddyfile = f"""{{
+    order forward_proxy before file_server
+}}
+
+:{PORTS['naive']}, localhost:{PORTS['naive']} {{
+    tls {crt} {key}
+    forward_proxy {{
+        basic_auth {NAIVE_USER} {NAIVE_PASS}
+        hide_ip
+        hide_via
+        probe_resistance
+    }}
+    file_server {{
+        root /var/www/html
+    }}
+}}
+"""
+    os.makedirs("/etc/caddy", exist_ok=True)
+    os.makedirs("/var/www/html", exist_ok=True)
+    with open("/var/www/html/index.html", "w") as f:
+        f.write("<html><body>Welcome</body></html>")
+    with open("/etc/caddy/Caddyfile", "w") as f:
+        f.write(caddyfile)
+
+    svc = """[Unit]
+Description=NaïveProxy (Caddy)
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+"""
+    with open("/etc/systemd/system/naive.service", "w") as f:
+        f.write(svc)
+    run("systemctl daemon-reload && systemctl enable --now naive", True)
+    time.sleep(3)
+    ok = shell("systemctl is-active naive") == "active"
+    log(f"NaïveProxy: {'running ✓' if ok else 'FAILED ✗'}")
+    return ok
+
+
+# ─────────────────────────────────────────────────────────────
+#  SSH SOCKS5
+# ─────────────────────────────────────────────────────────────
+
+def setup_ssh() -> bool:
+    log("Configuring SSH SOCKS5 ...")
+    run(f"useradd -m -s /bin/false {SSH_USER}", True)
+    run(f"echo '{SSH_USER}:{SSH_PASS}' | chpasswd", True)
+
+    sshd_extra = """
+AllowTcpForwarding yes
+PermitTunnel yes
+GatewayPorts yes
+"""
+    with open("/etc/ssh/sshd_config.d/socks5.conf", "w") as f:
+        f.write(sshd_extra)
+    run("systemctl restart sshd", True)
+    ok = shell("systemctl is-active ssh") in ("active",) or \
+         shell("systemctl is-active sshd") == "active"
+    log(f"SSH SOCKS5: {'ready ✓' if ok else 'check manually'}")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
 #  LINK GENERATION
 # ─────────────────────────────────────────────────────────────
 
-def generate_links(ip, uid, trojan_pass, ss_key, pub, dest_option, sid):
+def generate_all_links(ip: str, uid: str, trojan_pass: str, ss_key: str,
+                       pub: str, dest_opt: dict, sid: str,
+                       hy_pass: str, tuic_uuid: str, tuic_pass: str) -> dict:
     q    = urllib.parse.quote
     host = DOMAIN if DOMAIN else ip
-    sni  = dest_option["sni"][0] if dest_option["sni"] else ""
-    fp   = dest_option["fp"]
-
-    reality_params = (
-        f"encryption=none&security=reality"
-        f"&sni={sni}&fp={fp}&pbk={pub}&sid={sid}"
-        f"&type=tcp&flow=xtls-rprx-vision"
-    )
-    reality_grpc_params = (
-        f"encryption=none&security=reality"
-        f"&sni={sni}&fp={fp}&pbk={pub}&sid={sid}"
-        f"&type=grpc&serviceName={GRPC_SERVICE}"
-    )
+    sni  = dest_opt["sni"][0] if dest_opt["sni"] else ""
+    fp   = dest_opt["fp"]
 
     return {
-        "VLESS REALITY+Vision (best)": (
-            f"vless://{uid}@{ip}:{PORTS['reality_vision']}?{reality_params}#REALITY-Vision"
+        "VLESS REALITY+Vision": (
+            f"vless://{uid}@{ip}:{PORTS['reality_vision']}"
+            f"?encryption=none&security=reality&sni={sni}&fp={fp}"
+            f"&pbk={pub}&sid={sid}&type=tcp&flow=xtls-rprx-vision"
+            f"#REALITY-Vision"
         ),
-        "VLESS REALITY+gRPC (Iran-resistant)": (
-            f"vless://{uid}@{ip}:{PORTS['reality_grpc']}?{reality_grpc_params}#REALITY-gRPC"
+        "VLESS REALITY+gRPC": (
+            f"vless://{uid}@{ip}:{PORTS['reality_grpc']}"
+            f"?encryption=none&security=reality&sni={sni}&fp={fp}"
+            f"&pbk={pub}&sid={sid}&type=grpc&serviceName={GRPC_SVC}"
+            f"#REALITY-gRPC"
         ),
-        "VLESS WS+TLS (CDN)": (
+        "VLESS WS+TLS": (
             f"vless://{uid}@{host}:{PORTS['ws_tls']}"
             f"?encryption=none&security=tls&sni={host}"
             f"&type=ws&path={q(WS_PATH)}&host=microsoft.com"
@@ -496,15 +596,8 @@ def generate_links(ip, uid, trojan_pass, ss_key, pub, dest_option, sid):
         ),
         "Trojan gRPC+TLS": (
             f"trojan://{trojan_pass}@{host}:{PORTS['grpc_tls']}"
-            f"?security=tls&sni={host}&type=grpc"
-            f"&serviceName={GRPC_SERVICE}&alpn=h2"
+            f"?security=tls&sni={host}&type=grpc&serviceName={GRPC_SVC}&alpn=h2"
             f"#Trojan-gRPC-TLS"
-        ),
-        "VLESS H2+TLS": (
-            f"vless://{uid}@{host}:{PORTS['h2_tls']}"
-            f"?encryption=none&security=tls&sni={host}"
-            f"&type=h2&path={q(H2_PATH)}&host=microsoft.com"
-            f"#VLESS-H2-TLS"
         ),
         "Shadowsocks 2022": (
             "ss://" +
@@ -513,92 +606,204 @@ def generate_links(ip, uid, trojan_pass, ss_key, pub, dest_option, sid):
             ).decode().rstrip("=") +
             f"@{ip}:{PORTS['ss2022']}#SS2022"
         ),
-        "VLESS SplitHTTP": (
-            f"vless://{uid}@{ip}:{PORTS['splithttp']}"
-            f"?encryption=none&type=splithttp"
-            f"&path={q(SPLIT_PATH)}&host=microsoft.com"
-            f"#VLESS-SplitHTTP"
+        "Hysteria2": (
+            f"hysteria2://{hy_pass}@{ip}:{PORTS['hysteria2']}"
+            f"?insecure=1&sni=microsoft.com"
+            f"#Hysteria2"
+        ),
+        "TUIC v5": (
+            f"tuic://{tuic_uuid}:{tuic_pass}@{ip}:{PORTS['tuic']}"
+            f"?congestion_control=bbr&alpn=h3,spdy%2F3.1"
+            f"&udp_relay_mode=native&allow_insecure=1"
+            f"#TUIC-v5"
+        ),
+        "NaïveProxy": (
+            f"https://{NAIVE_USER}:{NAIVE_PASS}@{ip}:{PORTS['naive']}"
+            f"#NaiveProxy"
+        ),
+        "SSH SOCKS5": (
+            f"ssh -D 1080 -N {SSH_USER}@{ip} -p 22\n"
+            f"  Password: {SSH_PASS}"
         ),
     }
 
 
 # ─────────────────────────────────────────────────────────────
-#  TELEGRAM MESSAGE
+#  TELEGRAM MESSAGES  (split to avoid 4096 char limit)
 # ─────────────────────────────────────────────────────────────
 
-def build_message(links, ip, uid, trojan_pass, ss_key, dest_option):
-    lines = [
-        "🛡 <b>Advanced Xray VPN — Ready</b>", "",
-        f"🌐 <b>IP:</b> <code>{ip}</code>",
-        f"🔑 <b>UUID:</b> <code>{uid}</code>",
-        f"🔐 <b>Trojan:</b> <code>{trojan_pass}</code>",
-        f"🔒 <b>SS2022:</b> <code>{ss_key}</code>",
-        f"🎭 <b>REALITY dest:</b> <code>{dest_option['dest']}</code>",
-        f"📝 <b>Why:</b> {dest_option['reason']}",
-        "⏱ <b>Uptime:</b> ~2 hours", "",
+def telegram_header(ip: str, uid: str, trojan_pass: str, ss_key: str,
+                    hy_pass: str, tuic_uuid: str, tuic_pass: str,
+                    dest_opt: dict, runtime: int) -> str:
+    return "\n".join([
+        "🛡 <b>All-in-One Anti-Censorship VPN — Ready</b>",
+        "",
+        f"🌐 <b>Server IP:</b> <code>{ip}</code>",
+        f"⏱ <b>Uptime:</b> ~{runtime} hours",
+        f"🎭 <b>REALITY dest:</b> <code>{dest_opt['dest']}</code>",
+        "",
+        "<b>— Credentials —</b>",
+        f"UUID (Xray):  <code>{uid}</code>",
+        f"Trojan pass:  <code>{trojan_pass}</code>",
+        f"SS2022 key:   <code>{ss_key}</code>",
+        f"Hysteria2:    <code>{hy_pass}</code>",
+        f"TUIC uuid:    <code>{tuic_uuid}</code>",
+        f"TUIC pass:    <code>{tuic_pass}</code>",
+        f"Naive user:   <code>{NAIVE_USER}</code>",
+        f"Naive pass:   <code>{NAIVE_PASS}</code>",
+        f"SSH user:     <code>{SSH_USER}</code>",
+        f"SSH pass:     <code>{SSH_PASS}</code>",
+        "",
         "━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    icons = ["🔮", "🇮🇷", "☁️", "⚡", "🌐", "🔒", "🔀"]
-    for (name, link), icon in zip(links.items(), icons):
-        lines += ["", f"{icon} <b>{name}</b>", f"<code>{link}</code>"]
+    ])
 
-    lines += [
-        "", "━━━━━━━━━━━━━━━━━━━━━━━",
-        "💡 <b>Priority order:</b>",
-        "1 REALITY+gRPC (Iran best)  2 REALITY+Vision",
-        "3 Trojan gRPC  4 VLESS H2  5 VLESS WS  6 SS2022",
-        "", "⚠️ <i>Server shuts down after 2 hours.</i>",
-    ]
-    return "\n".join(lines)
+def telegram_links(links: dict) -> list[str]:
+    """Split links into chunks under 4000 chars each."""
+    icons = ["🔮","🔷","☁️","⚡","🔒","🚀","🌀","🕵️","🔑"]
+    messages, chunk = [], []
+    for (name, link), icon in zip(links.items(), icons):
+        block = f"\n{icon} <b>{name}</b>\n<code>{link}</code>\n"
+        if sum(len(c) for c in chunk) + len(block) > 3800:
+            messages.append("".join(chunk))
+            chunk = []
+        chunk.append(block)
+    if chunk:
+        messages.append("".join(chunk))
+    return messages
+
+def telegram_priority() -> str:
+    return "\n".join([
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        "💡 <b>Priority (Iran best → worst):</b>",
+        "1 REALITY+gRPC   2 REALITY+Vision",
+        "3 NaïveProxy (HTTP/2)   4 Hysteria2 (if UDP open)",
+        "5 TUIC v5 (if UDP open) 6 Trojan gRPC",
+        "7 VLESS WS   8 SS2022   9 SSH SOCKS5",
+        "",
+        "⚠️ <i>Server shuts down automatically.</i>",
+    ])
 
 
 # ─────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
+    log("=" * 60)
+    log("All-in-One VPN Setup — Starting")
+    log("=" * 60)
+
+    # Generate secrets
     uid         = str(uuid.uuid4())
     trojan_pass = secrets.token_hex(16)
-    ip          = get_server_ip()
+    ss_key      = base64.b64encode(secrets.token_bytes(32)).decode()
+    hy_pass     = secrets.token_hex(16)
+    tuic_uuid   = str(uuid.uuid4())
+    tuic_pass   = secrets.token_hex(12)
     sid         = secrets.token_hex(4)
 
-    print(f"[*] Server IP : {ip}")
-    print(f"[*] UUID      : {uid}")
+    ip = get_server_ip()
+    log(f"Server IP: {ip}")
 
-    install_xray()
+    enable_bbr()
+    key, crt    = create_certs()
+    dest_opt    = pick_reality_dest()
 
-    priv, pub    = generate_reality_keys()
-    ss_key       = generate_ss2022_key()
-    key, crt     = create_self_signed_cert()
-    dest_option  = pick_best_reality_dest()
+    if dest_opt["dest"].split(":")[0] != "1.1.1.1":
+        setup_iptables(dest_opt["dest"].split(":")[0])
 
-    # Setup iptables so UDP/443 and TCP/80 forward to dest IP
-    dest_host = dest_option["dest"].split(":")[0]
-    if dest_host != "1.1.1.1":
-        setup_iptables_forwarding(dest_host)
+    # Install everything in parallel
+    log("Starting parallel installation ...")
+    results = {}
 
-    create_config(priv, uid, trojan_pass, ss_key, key, crt, dest_option, sid)
+    def task_xray():
+        if install_xray():
+            make_xray_config(uid, trojan_pass, ss_key, key, crt, dest_opt, sid)
+            ok = start_xray()
+            # Read public key written during config generation
+            try:
+                with open("/tmp/xray_pubkey") as f:
+                    pub = f.read().strip()
+            except Exception:
+                pub = shell("xray x25519").split("\n")[1].split(":", 1)[1].strip()
+            return ("xray", ok, pub)
+        return ("xray", False, "")
 
-    run("systemctl restart xray && systemctl enable xray")
-    time.sleep(3)
-    status = shell("systemctl is-active xray")
-    print(f"[*] Xray status: {status}")
+    def task_hy2():
+        return ("hysteria2", install_hysteria2(hy_pass, key, crt))
 
-    links = generate_links(ip, uid, trojan_pass, ss_key, pub, dest_option, sid)
+    def task_tuic():
+        return ("tuic", install_tuic(tuic_uuid, tuic_pass, key, crt))
 
+    def task_naive():
+        return ("naive", install_naiveproxy(key, crt))
+
+    def task_ssh():
+        return ("ssh", setup_ssh())
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = [
+            ex.submit(task_xray),
+            ex.submit(task_hy2),
+            ex.submit(task_tuic),
+            ex.submit(task_naive),
+            ex.submit(task_ssh),
+        ]
+        pub = ""
+        for f in as_completed(futures):
+            result = f.result()
+            name = result[0]
+            ok   = result[1]
+            results[name] = ok
+            if name == "xray" and len(result) == 3:
+                pub = result[2]
+            log(f"  [{name}] {'✓' if ok else '✗'}")
+
+    # Summary
+    log("=" * 60)
+    log("Installation Summary:")
+    for svc, ok in results.items():
+        log(f"  {svc:12s}: {'OK' if ok else 'FAILED'}")
+    log("=" * 60)
+
+    # Generate links
+    links = generate_all_links(
+        ip, uid, trojan_pass, ss_key, pub, dest_opt, sid,
+        hy_pass, tuic_uuid, tuic_pass,
+    )
+
+    # Print to console
     print("\n" + "=" * 70)
     for name, link in links.items():
         print(f"\n[{name}]\n{link}")
     print("=" * 70)
 
-    send_telegram(build_message(links, ip, uid, trojan_pass, ss_key, dest_option))
-    send_telegram("✅ Server live — auto-shutdown in 2 hours.")
+    # Telegram — header + credentials
+    hdr = telegram_header(
+        ip, uid, trojan_pass, ss_key,
+        hy_pass, tuic_uuid, tuic_pass,
+        dest_opt, RUNTIME_HOURS,
+    )
+    send_telegram(hdr)
 
-    print("\n[*] Sleeping 2 hours ...")
-    time.sleep(7200)
+    # Telegram — links (chunked)
+    for chunk in telegram_links(links):
+        send_telegram(chunk)
+        time.sleep(0.5)
 
-    send_telegram("🔴 2h session ended. Shutting down.")
-    print("[*] Done.")
+    send_telegram(telegram_priority())
+    send_telegram(f"✅ All services live. Auto-shutdown in {RUNTIME_HOURS} hours.")
+
+    # Keep alive
+    log(f"Sleeping {RUNTIME_HOURS} hours ...")
+    for hour in range(RUNTIME_HOURS):
+        time.sleep(3600)
+        remaining = RUNTIME_HOURS - hour - 1
+        if remaining > 0:
+            send_telegram(f"⏳ Server alive. {remaining}h remaining.")
+
+    send_telegram("🔴 Session ended. Server shutting down.")
+    log("Done.")
 
 
 if __name__ == "__main__":
